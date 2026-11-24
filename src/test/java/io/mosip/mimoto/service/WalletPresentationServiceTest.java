@@ -41,6 +41,8 @@ import io.mosip.openID4VP.authorizationResponse.unsignedVPToken.UnsignedVPToken;
 import io.mosip.openID4VP.authorizationResponse.vpTokenSigningResult.VPTokenSigningResult;
 import io.mosip.openID4VP.common.OpenID4VPErrorCodes;
 import io.mosip.openID4VP.constants.FormatType;
+import io.mosip.openID4VP.dcql.query.ClaimsQuery;
+import io.mosip.openID4VP.dcql.query.CredentialQuery;
 import io.mosip.openID4VP.dcql.query.DCQLQuery;
 import io.mosip.openID4VP.exceptions.OpenID4VPExceptions;
 import io.mosip.openID4VP.verifier.VerifierResponse;
@@ -933,7 +935,7 @@ public class WalletPresentationServiceTest {
     }
 
     @Test
-    public void testSubmitPresentationDcqlUnionsClaimSetPathsForSameCredentialAcrossQueries() throws Exception {
+    public void testSubmitPresentationDcqlScopesClaimSetPathsPerQueryForSameCredential() throws Exception {
         String credentialId = "d0b504e8-adaf-4df1-9ba0-2d2a5c52e519";
         String ageQueryId = "age-proof";
         String dobQueryId = "dob-proof";
@@ -1024,8 +1026,9 @@ public class WalletPresentationServiceTest {
             ArgumentCaptor<Map<String, List<io.mosip.openID4VP.wallet.Credential>>> mapCaptor =
                     ArgumentCaptor.forClass(Map.class);
             verify(mockOpenID4VP).constructUnsignedVPToken(mapCaptor.capture());
-            String filteredSdJwt = (String) mapCaptor.getValue().get(ageQueryId).get(0).getData();
-            assertEquals("header.payload.sig~ageDiscB64~dobDiscB64~", filteredSdJwt);
+            Map<String, List<io.mosip.openID4VP.wallet.Credential>> credentialMap = mapCaptor.getValue();
+            assertEquals("header.payload.sig~ageDiscB64~", credentialMap.get(ageQueryId).get(0).getData());
+            assertEquals("header.payload.sig~dobDiscB64~", credentialMap.get(dobQueryId).get(0).getData());
         }
     }
 
@@ -2613,6 +2616,93 @@ public class WalletPresentationServiceTest {
 
         Map<String, List<String>> result = (Map<String, List<String>>) method.invoke(
                 walletPresentationService, request, sessionData, Map.of());
+
+        assertNull(result);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, List<String>> invokeScopeSdClaimsToQuery(
+            Map<String, List<String>> selected, String credentialId, CredentialQuery query, String format) throws Exception {
+        Method method = WalletPresentationServiceImpl.class.getDeclaredMethod(
+                "scopeSdClaimsToQuery", Map.class, String.class, CredentialQuery.class, DecryptedCredentialDTO.class);
+        method.setAccessible(true);
+        DecryptedCredentialDTO dto = DecryptedCredentialDTO.builder()
+                .id(credentialId)
+                .credential(VCCredentialResponse.builder().format(format).credential("raw").build())
+                .build();
+        return (Map<String, List<String>>) method.invoke(walletPresentationService, selected, credentialId, query, dto);
+    }
+
+    private CredentialQuery dcqlQuery(String id, String format, List<?>... paths) {
+        List<ClaimsQuery> claims = new ArrayList<>();
+        for (List<?> path : paths) {
+            claims.add(new ClaimsQuery("claim-" + claims.size(), path, null));
+        }
+        return new CredentialQuery(id, format, false, Map.of(), false, claims, null);
+    }
+
+    @Test
+    public void testScopeSdClaimsToQueryKeepsOnlySdJwtClaimsOfThatQuery() throws Exception {
+        Map<String, List<String>> selected = Map.of("cred-1", List.of("dateOfBirth", "$.region"));
+
+        Map<String, List<String>> dob = invokeScopeSdClaimsToQuery(selected, "cred-1",
+                dcqlQuery("dob_q", "dc+sd-jwt", List.of("dateOfBirth")), "dc+sd-jwt");
+        Map<String, List<String>> region = invokeScopeSdClaimsToQuery(selected, "cred-1",
+                dcqlQuery("region_q", "dc+sd-jwt", List.of("region")), "dc+sd-jwt");
+
+        assertEquals(List.of("dateOfBirth"), dob.get("cred-1"));
+        assertEquals(List.of("$.region"), region.get("cred-1"));
+    }
+
+    @Test
+    public void testScopeSdClaimsToQueryKeepsNestedSdJwtClaimsUnderRequestedPath() throws Exception {
+        Map<String, List<String>> selected = Map.of("cred-1", List.of("address.city", "addressLine1"));
+
+        Map<String, List<String>> result = invokeScopeSdClaimsToQuery(selected, "cred-1",
+                dcqlQuery("q", "dc+sd-jwt", List.of("address")), "dc+sd-jwt");
+
+        assertEquals(List.of("address.city"), result.get("cred-1"));
+    }
+
+    @Test
+    public void testScopeSdClaimsToQueryKeepsOnlyMdocClaimsOfThatQuery() throws Exception {
+        String familyName = "$['org.iso.18013.5.1']['family_name']";
+        String givenName = "$['org.iso.18013.5.1']['given_name']";
+        Map<String, List<String>> selected = Map.of("mdoc-1", List.of(familyName, givenName));
+
+        Map<String, List<String>> family = invokeScopeSdClaimsToQuery(selected, "mdoc-1",
+                dcqlQuery("family", "mso_mdoc", List.of("org.iso.18013.5.1", "family_name")), "mso_mdoc");
+        Map<String, List<String>> given = invokeScopeSdClaimsToQuery(selected, "mdoc-1",
+                dcqlQuery("given", "mso_mdoc", List.of("org.iso.18013.5.1", "given_name")), "mso_mdoc");
+
+        assertEquals(List.of(familyName), family.get("mdoc-1"));
+        assertEquals(List.of(givenName), given.get("mdoc-1"));
+    }
+
+    @Test
+    public void testScopeSdClaimsToQueryReturnsEmptyWhenQueryAsksForNoneOfTheSelectedClaims() throws Exception {
+        Map<String, List<String>> selected = Map.of("cred-1", List.of("dateOfBirth"));
+
+        Map<String, List<String>> result = invokeScopeSdClaimsToQuery(selected, "cred-1",
+                dcqlQuery("email_q", "dc+sd-jwt", List.of("email")), "dc+sd-jwt");
+
+        assertEquals(List.of(), result.get("cred-1"));
+    }
+
+    @Test
+    public void testScopeSdClaimsToQueryLeavesSelectionWhenQueryHasNoClaims() throws Exception {
+        Map<String, List<String>> selected = Map.of("cred-1", List.of("dateOfBirth"));
+
+        Map<String, List<String>> result = invokeScopeSdClaimsToQuery(selected, "cred-1",
+                dcqlQuery("q", "dc+sd-jwt"), "dc+sd-jwt");
+
+        assertSame(selected, result);
+    }
+
+    @Test
+    public void testScopeSdClaimsToQueryLeavesMissingSelectionUntouched() throws Exception {
+        Map<String, List<String>> result = invokeScopeSdClaimsToQuery(null, "cred-1",
+                dcqlQuery("q", "dc+sd-jwt", List.of("email")), "dc+sd-jwt");
 
         assertNull(result);
     }

@@ -27,6 +27,7 @@ import io.mosip.mimoto.util.DcqlClaimSetHelper;
 import io.mosip.mimoto.util.DcqlMatchingHelper;
 import io.mosip.mimoto.util.DcqlCredentialSetHelper;
 import io.mosip.mimoto.util.MdocSelectiveDisclosureUtil;
+import io.mosip.mimoto.util.MdocSelectiveDisclosureUtil.MdocClaim;
 import io.mosip.mimoto.util.SelectedSdClaimsUtil;
 import io.mosip.openID4VP.OpenID4VP;
 import io.mosip.openID4VP.authorizationRequest.AuthorizationDcqlRequest;
@@ -310,9 +311,16 @@ public class WalletPresentationServiceImpl implements WalletPresentationService 
         Map<String, DecryptedCredentialDTO> cache = Optional.ofNullable(sessionData.getMatchingCredentials())
                 .orElse(List.of()).stream()
                 .collect(Collectors.toMap(DecryptedCredentialDTO::getId, d -> d));
+        DCQLQuery dcqlQuery = AuthorizationRequestHelper.extractDcqlQuery(sessionData.getParsedAuthorizationRequest());
+        Map<String, CredentialQuery> queriesById = dcqlQuery == null || dcqlQuery.getCredentials() == null
+                ? Map.of()
+                : dcqlQuery.getCredentials().stream()
+                        .collect(Collectors.toMap(CredentialQuery::getId, q -> q, (a, b) -> a));
 
         Map<String, List<Credential>> result = new LinkedHashMap<>();
         for (DcqlCredentialSelection selection : selections) {
+            String mapKey = resolveDcqlMapKey(selection, cache);
+            CredentialQuery credentialQuery = queriesById.get(mapKey);
             List<Credential> credentials = new ArrayList<>();
             for (String id : selection.getSelectedCredentialIds()) {
                 DecryptedCredentialDTO sessionDto = cache.get(id);
@@ -326,9 +334,9 @@ public class WalletPresentationServiceImpl implements WalletPresentationService 
                 }
                 DecryptedCredentialDTO credentialForSubmission =
                         resolveCredentialForSubmission(sessionDto, walletCredentialsById);
-                credentials.add(toLibraryCredential(credentialForSubmission, effectiveSdClaims));
+                credentials.add(toLibraryCredential(credentialForSubmission,
+                        scopeSdClaimsToQuery(effectiveSdClaims, id, credentialQuery, credentialForSubmission)));
             }
-            String mapKey = resolveDcqlMapKey(selection, cache);
             result.merge(mapKey, credentials, (existing, incoming) -> {
                 List<Credential> merged = new ArrayList<>(existing);
                 merged.addAll(incoming);
@@ -336,6 +344,45 @@ public class WalletPresentationServiceImpl implements WalletPresentationService 
             });
         }
         return result;
+    }
+
+    /**
+     * A credential picked for several DCQL queries carries the claims of all of them, so each
+     * query's presentation keeps only the paths that query asks for. A query without claims
+     * keeps the selection unchanged.
+     */
+    private Map<String, List<String>> scopeSdClaimsToQuery(
+            Map<String, List<String>> selectedSdClaims, String credentialId,
+            CredentialQuery credentialQuery, DecryptedCredentialDTO credential) {
+        List<String> paths = selectedSdClaims != null ? selectedSdClaims.get(credentialId) : null;
+        if (paths == null || credentialQuery == null
+                || credentialQuery.getClaims() == null || credentialQuery.getClaims().isEmpty()) {
+            return selectedSdClaims;
+        }
+        boolean mdoc = CredentialFormat.isMdoc(credential.getCredential().getFormat());
+        List<String> scoped = paths.stream()
+                .filter(path -> credentialQuery.getClaims().stream()
+                        .anyMatch(claim -> claimPathMatches(path, claim, mdoc)))
+                .toList();
+        return Map.of(credentialId, scoped);
+    }
+
+    private boolean claimPathMatches(String selectedPath, ClaimsQuery claim, boolean mdoc) {
+        List<?> segments = claim.getPath();
+        if (segments == null || segments.isEmpty()) {
+            return false;
+        }
+        if (mdoc) {
+            MdocClaim selected = MdocSelectiveDisclosureUtil.parse(selectedPath);
+            return selected != null && segments.size() == 2
+                    && selected.namespace().equals(String.valueOf(segments.get(0)))
+                    && selected.elementIdentifier().equals(String.valueOf(segments.get(1)));
+        }
+        String selected = normalizeSdClaimPath(selectedPath);
+        String requested = normalizeSdClaimPath(DcqlClaimSetHelper.buildClaimPath(segments));
+        return selected.equals(requested)
+                || selected.startsWith(requested + ".")
+                || selected.startsWith(requested + "[");
     }
 
     /**
